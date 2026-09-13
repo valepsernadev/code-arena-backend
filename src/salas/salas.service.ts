@@ -60,7 +60,28 @@ export class SalasService {
       throw new BadRequestException({ error: data.error });
     }
 
+    await this.iniciarPartidaSiCorresponde(codigo);
+
     return this.obtenerSala(codigo);
+  }
+
+  private async iniciarPartidaSiCorresponde(codigo: string): Promise<void> {
+    const supabase = this.supabaseService.getCliente();
+
+    const { data: sala } = await supabase
+      .from('salas')
+      .select('*')
+      .eq('codigo', codigo)
+      .maybeSingle();
+
+    if (!sala || sala.estado !== 'WAITING' || sala.jugador_count < 2) {
+      return;
+    }
+
+    await supabase
+      .from('salas')
+      .update({ estado: 'PLAYING' })
+      .eq('id', sala.id);
   }
 
   async obtenerSala(codigo: string) {

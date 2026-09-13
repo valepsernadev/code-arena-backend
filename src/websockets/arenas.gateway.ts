@@ -22,6 +22,7 @@ const MAX_Y = 50;
 
 const PUNTOS_RESPUESTA_CORRECTA = 10;
 const RESPUESTAS_PARA_GANAR = 5;
+const DURACION_PARTIDA_MS = 300 * 1000;
 
 const HABILIDADES = ['Boost', 'Attack', 'Shield'];
 
@@ -44,7 +45,14 @@ interface JugadorConectado {
   color: string;
 }
 
-@WebSocketGateway({ cors: { origin: 'http://localhost:4200' } })
+@WebSocketGateway({
+  cors: {
+    origin: [
+      'http://localhost:4200',
+      'https://code-arena-frontend-delta.vercel.app',
+    ],
+  },
+})
 export class ArenasGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
   server: Server;
@@ -54,6 +62,10 @@ export class ArenasGateway implements OnGatewayConnection, OnGatewayDisconnect {
   private salas = new Map<string, Socket[]>();
   private jugadores = new Map<string, JugadorConectado>();
   private preguntasPendientes = new Map<string, Pregunta>();
+  private partidas = new Map<
+    string,
+    { inicio: number; intervalo: ReturnType<typeof setInterval> }
+  >();
 
   constructor(
     private readonly supabaseService: SupabaseService,
@@ -276,9 +288,6 @@ export class ArenasGateway implements OnGatewayConnection, OnGatewayDisconnect {
         descripcion: DESCRIPCIONES[habilidad],
       });
 
-      if (respuestasConsecutivas >= RESPUESTAS_PARA_GANAR) {
-        await this.finalizarSala(payload.salaId);
-      }
     } else {
       const vidasRestantes = Math.max(0, jugador.vidas - 1);
 
@@ -295,13 +304,9 @@ export class ArenasGateway implements OnGatewayConnection, OnGatewayDisconnect {
         mensaje: `Respuesta incorrecta. Te quedan ${vidasRestantes} vidas.`,
       });
 
-      const vivos = await this.jugadoresVivos(payload.salaId);
-
-      if (vivos === 1) {
-        await this.finalizarSala(payload.salaId);
-      }
     }
 
+    await this.verificarVictoria(payload.salaId);
     await this.emitirEstadoSala(payload.salaId);
   }
 
@@ -369,6 +374,8 @@ export class ArenasGateway implements OnGatewayConnection, OnGatewayDisconnect {
       .eq('id', salaId)
       .maybeSingle();
 
+    this.iniciarRelojSiCorresponde(salaId, sala);
+
     const { data: jugadores } = await supabase
       .from('jugadores')
       .select('*')
@@ -381,18 +388,137 @@ export class ArenasGateway implements OnGatewayConnection, OnGatewayDisconnect {
     });
   }
 
-  private async jugadoresVivos(salaId: string): Promise<number> {
+  private async verificarVictoria(salaId: string): Promise<void> {
+    const supabase = this.supabaseService.getCliente();
+
+    const { data: sala } = await supabase
+      .from('salas')
+      .select('*')
+      .eq('id', salaId)
+      .maybeSingle();
+
+    if (!sala || sala.estado !== 'PLAYING') {
+      this.detenerReloj(salaId);
+      return;
+    }
+
+    const { data: jugadores } = await supabase
+      .from('jugadores')
+      .select('*')
+      .eq('sala_id', salaId);
+
+    const lista = jugadores ?? [];
+
+    if (lista.length === 0) {
+      return;
+    }
+
+    const racha = lista.find(
+      (j) => j.respuestas_correctas_seguidas >= RESPUESTAS_PARA_GANAR,
+    );
+
+    if (racha) {
+      await this.cerrarConGanador(
+        salaId,
+        racha,
+        `${RESPUESTAS_PARA_GANAR} respuestas correctas consecutivas`,
+      );
+      return;
+    }
+
+    const vivos = lista.filter((j) => j.vidas > 0);
+
+    if (vivos.length === 1) {
+      await this.cerrarConGanador(salaId, vivos[0], 'Último jugador vivo');
+      return;
+    }
+
+    const partida = this.partidas.get(salaId);
+
+    if (partida && Date.now() - partida.inicio >= DURACION_PARTIDA_MS) {
+      const ganador = await this.ganadorPorPuntaje(salaId, lista);
+
+      if (ganador) {
+        await this.cerrarConGanador(
+          salaId,
+          ganador,
+          'Mayor puntaje al agotarse el tiempo',
+        );
+      }
+    }
+  }
+
+  private async ganadorPorPuntaje(
+    salaId: string,
+    jugadores: any[],
+  ): Promise<any> {
     const supabase = this.supabaseService.getCliente();
 
     const { data } = await supabase
-      .from('jugadores')
-      .select('vidas')
+      .from('preguntas_respondidas')
+      .select('jugador_id')
       .eq('sala_id', salaId);
 
-    return (data ?? []).filter((j) => j.vidas > 0).length;
+    const respondidas = new Map<string, number>();
+
+    (data ?? []).forEach((pregunta) => {
+      respondidas.set(
+        pregunta.jugador_id,
+        (respondidas.get(pregunta.jugador_id) ?? 0) + 1,
+      );
+    });
+
+    const ordenados = [...jugadores].sort((a, b) => {
+      if (b.puntaje !== a.puntaje) {
+        return b.puntaje - a.puntaje;
+      }
+
+      return (respondidas.get(b.id) ?? 0) - (respondidas.get(a.id) ?? 0);
+    });
+
+    return ordenados[0];
+  }
+
+  private iniciarRelojSiCorresponde(salaId: string, sala: any): void {
+    if (!sala || sala.estado !== 'PLAYING' || this.partidas.has(salaId)) {
+      return;
+    }
+
+    const intervalo = setInterval(() => {
+      void this.verificarVictoria(salaId);
+    }, 1000);
+
+    this.partidas.set(salaId, { inicio: Date.now(), intervalo });
+  }
+
+  private detenerReloj(salaId: string): void {
+    const partida = this.partidas.get(salaId);
+
+    if (!partida) {
+      return;
+    }
+
+    clearInterval(partida.intervalo);
+    this.partidas.delete(salaId);
+  }
+
+  private async cerrarConGanador(
+    salaId: string,
+    ganador: any,
+    razon: string,
+  ): Promise<void> {
+    await this.finalizarSala(salaId);
+
+    this.emitirASala(salaId, 'partidaTerminada', {
+      ganador: ganador.nickname,
+      razon,
+      puntajeFinal: ganador.puntaje,
+    });
   }
 
   private async finalizarSala(salaId: string): Promise<void> {
+    this.detenerReloj(salaId);
+
     const supabase = this.supabaseService.getCliente();
 
     await supabase
