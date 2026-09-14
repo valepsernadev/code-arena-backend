@@ -74,7 +74,11 @@ export class SalasService {
       .eq('codigo', codigo)
       .maybeSingle();
 
-    if (!sala || sala.estado !== 'WAITING' || sala.jugador_count < 2) {
+    if (
+      !sala ||
+      sala.estado !== 'WAITING' ||
+      sala.jugador_count < sala.capacidad
+    ) {
       return;
     }
 

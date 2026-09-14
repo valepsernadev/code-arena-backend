@@ -66,6 +66,7 @@ export class ArenasGateway implements OnGatewayConnection, OnGatewayDisconnect {
     string,
     { inicio: number; intervalo: ReturnType<typeof setInterval> }
   >();
+  private escudos = new Map<string, number>();
 
   constructor(
     private readonly supabaseService: SupabaseService,
@@ -310,17 +311,114 @@ export class ArenasGateway implements OnGatewayConnection, OnGatewayDisconnect {
     await this.emitirEstadoSala(payload.salaId);
   }
 
+  @SubscribeMessage('iniciarPartida')
+  async iniciarPartida(
+    @ConnectedSocket() socket: Socket,
+    @MessageBody() payload: { salaId: string },
+  ): Promise<void> {
+    const supabase = this.supabaseService.getCliente();
+
+    const { data: sala } = await supabase
+      .from('salas')
+      .select('*')
+      .eq('id', payload.salaId)
+      .maybeSingle();
+
+    if (!sala || sala.estado !== 'WAITING' || sala.jugador_count < 2) {
+      return;
+    }
+
+    await supabase
+      .from('salas')
+      .update({ estado: 'PLAYING' })
+      .eq('id', sala.id);
+
+    await this.emitirEstadoSala(payload.salaId);
+  }
+
   @SubscribeMessage('usarHabilidad')
   async usarHabilidad(
     @ConnectedSocket() socket: Socket,
     @MessageBody()
     payload: { salaId: string; jugadorId: string; habilidad: string },
   ): Promise<void> {
-    this.logger.log(
-      `Jugador ${payload.jugadorId} usa la habilidad ${payload.habilidad}`,
-    );
+    const supabase = this.supabaseService.getCliente();
 
+    const { data: jugador } = await supabase
+      .from('jugadores')
+      .select('*')
+      .eq('id', payload.jugadorId)
+      .maybeSingle();
+
+    if (!jugador || jugador.habilidad_desbloqueada !== payload.habilidad) {
+      return;
+    }
+
+    const duracion = DURACIONES[payload.habilidad];
+
+    if (duracion === undefined) {
+      return;
+    }
+
+    let objetivoId: string | null = null;
+    let anulado = false;
+
+    if (payload.habilidad === 'Attack') {
+      const { data: rivales } = await supabase
+        .from('jugadores')
+        .select('*')
+        .eq('sala_id', payload.salaId)
+        .neq('id', jugador.id)
+        .order('creado_en', { ascending: true });
+
+      const objetivo = (rivales ?? [])[0];
+
+      if (objetivo) {
+        objetivoId = objetivo.id;
+        anulado = this.escudoActivo(objetivo.id);
+
+        if (anulado) {
+          this.escudos.delete(objetivo.id);
+        } else {
+          const vidasRestantes = Math.max(0, objetivo.vidas - 1);
+
+          await supabase
+            .from('jugadores')
+            .update({ vidas: vidasRestantes })
+            .eq('id', objetivo.id);
+        }
+      }
+    }
+
+    if (payload.habilidad === 'Shield') {
+      this.escudos.set(jugador.id, Date.now() + duracion * 1000);
+    }
+
+    this.emitirASala(payload.salaId, 'habilidadUsada', {
+      jugadorId: jugador.id,
+      habilidad: payload.habilidad,
+      duracion,
+      objetivoId,
+      anulado,
+    });
+
+    await this.verificarVictoria(payload.salaId);
     await this.emitirEstadoSala(payload.salaId);
+  }
+
+  private escudoActivo(jugadorId: string): boolean {
+    const expiraEn = this.escudos.get(jugadorId);
+
+    if (!expiraEn) {
+      return false;
+    }
+
+    if (Date.now() >= expiraEn) {
+      this.escudos.delete(jugadorId);
+      return false;
+    }
+
+    return true;
   }
 
   @SubscribeMessage('reconectarSala')
@@ -384,8 +482,21 @@ export class ArenasGateway implements OnGatewayConnection, OnGatewayDisconnect {
     this.emitirASala(salaId, 'estadoSala', {
       jugadores: jugadores ?? [],
       sala,
+      tiempoRestante: this.tiempoRestante(salaId),
       timestamp: Date.now(),
     });
+  }
+
+  private tiempoRestante(salaId: string): number | null {
+    const partida = this.partidas.get(salaId);
+
+    if (!partida) {
+      return null;
+    }
+
+    const restante = DURACION_PARTIDA_MS - (Date.now() - partida.inicio);
+
+    return Math.max(0, Math.round(restante / 1000));
   }
 
   private async verificarVictoria(salaId: string): Promise<void> {
